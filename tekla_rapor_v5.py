@@ -409,11 +409,18 @@ class TeklaRaporIsleyici:
             return None
     
     def optimizasyon_sonuclarini_excele_kaydet(self):
-        """Optimizasyon sonuçlarını Excel'e kaydet"""
+          def optimizasyon_sonuclarini_excele_kaydet(self):
+        """Optimizasyon sonuçlarını Excel'e kaydet - Malzeme tipine göre gruplu"""
         try:
             if self.uretilen_excel_yolu and os.path.exists(self.uretilen_excel_yolu) and self.kesim_optimizasyon_sonucu:
                 # Mevcut Excel dosyasını aç
                 wb = openpyxl.load_workbook(self.uretilen_excel_yolu)
+                
+                # DATA sayfasındaki malzeme bilgilerini oku
+                if 'Data' in wb.sheetnames:
+                    data_df = pd.read_excel(self.uretilen_excel_yolu, sheet_name='Data')
+                else:
+                    data_df = pd.DataFrame()
                 
                 # Optimizasyon sayfasını oluştur (varsa sil)
                 if 'Kesim_Optimizasyon' in wb.sheetnames:
@@ -424,7 +431,7 @@ class TeklaRaporIsleyici:
                 
                 sonuc = self.kesim_optimizasyon_sonucu
                 
-                # Başlık
+                # ========== 1. ÖZET BİLGİLER ==========
                 ws.cell(row=1, column=1, value="KESİM OPTİMİZASYON SONUÇLARI")
                 ws.cell(row=1, column=1).font = Font(size=16, bold=True)
                 ws.merge_cells('A1:F1')
@@ -449,19 +456,118 @@ class TeklaRaporIsleyici:
                     ws.cell(row=i, column=1, value=label)
                     ws.cell(row=i, column=2, value=value)
                 
-                # Kesim detayları
-                start_row = len(ozet_bilgiler) + 7
+                # ========== 2. MALZEME TİPİNE GÖRE GRUPLAMA ==========
+                if not data_df.empty and 'Size' in data_df.columns:
+                    start_row = len(ozet_bilgiler) + 8
+                    
+                    ws.cell(row=start_row, column=1, value="MALZEME TİPİNE GÖRE KESİM DAĞILIMI")
+                    ws.cell(row=start_row, column=1).font = Font(size=14, bold=True)
+                    ws.merge_cells(f'A{start_row}:F{start_row}')
+                    
+                    # Başlıklar
+                    headers = ["Malzeme Tipi", "Adet", "Toplam Boy (mm)", "Stok Gereksinimi", "Fire (mm)", "Kullanım %"]
+                    header_row = start_row + 2
+                    for col, header in enumerate(headers, start=1):
+                        ws.cell(row=header_row, column=col, value=header)
+                        ws.cell(row=header_row, column=col).font = Font(bold=True)
+                        ws.cell(row=header_row, column=col).fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
+                    
+                    # Malzeme tiplerini grupla
+                    malzeme_gruplari = {}
+                    for idx, row in data_df.iterrows():
+                        size = row['Size']
+                        if pd.notna(row.get('Length(mm)')):
+                            length = row['Length(mm)']
+                            qty = row['Qty'] if pd.notna(row.get('Qty')) else 1
+                            
+                            if size not in malzeme_gruplari:
+                                malzeme_gruplari[size] = {
+                                    'adet': 0,
+                                    'toplam_boy': 0,
+                                    'boylar': []
+                                }
+                            
+                            malzeme_gruplari[size]['adet'] += qty
+                            malzeme_gruplari[size]['toplam_boy'] += length * qty
+                            for _ in range(int(qty)):
+                                malzeme_gruplari[size]['boylar'].append(length)
+                    
+                    # Her malzeme grubu için optimizasyon hesapla
+                    data_row = header_row + 1
+                    for malzeme_tipi, veri in malzeme_gruplari.items():
+                        # Bu malzeme tipi için kesim optimizasyonu
+                        boylar = veri['boylar']
+                        boylar.sort(reverse=True)
+                        
+                        kesim_planlari = []
+                        stok_boy = sonuc['stok_boy']
+                        
+                        while boylar:
+                            kalan_stok = stok_boy
+                            kesilenler = []
+                            
+                            for boy in boylar[:]:  # Copy of list
+                                if boy <= kalan_stok:
+                                    kesilenler.append(boy)
+                                    kalan_stok -= boy
+                                    boylar.remove(boy)
+                            
+                            if kesilenler:
+                                fire = kalan_stok
+                                kullanim_orani = ((stok_boy - fire) / stok_boy) * 100 if stok_boy > 0 else 0
+                                
+                                kesim_planlari.append({
+                                    'kesilenler': kesilenler,
+                                    'fire': fire,
+                                    'kullanim': kullanim_orani
+                                })
+                            else:
+                                break
+                        
+                        # Hesaplamalar
+                        toplam_stok = len(kesim_planlari)
+                        toplam_fire = sum(k['fire'] for k in kesim_planlari)
+                        ortalama_kullanim = sum(k['kullanim'] for k in kesim_planlari) / len(kesim_planlari) if kesim_planlari else 0
+                        
+                        # Excel'e yaz
+                        ws.cell(row=data_row, column=1, value=malzeme_tipi)
+                        ws.cell(row=data_row, column=2, value=veri['adet'])
+                        ws.cell(row=data_row, column=3, value=veri['toplam_boy'])
+                        ws.cell(row=data_row, column=4, value=toplam_stok)
+                        ws.cell(row=data_row, column=5, value=toplam_fire)
+                        ws.cell(row=data_row, column=6, value=f"{ortalama_kullanim:.1f}%")
+                        
+                        data_row += 1
+                    
+                    # Toplam satırı
+                    ws.cell(row=data_row, column=1, value="TOPLAM")
+                    ws.cell(row=data_row, column=2, value=f"=SUM(B{header_row+1}:B{data_row-1})")
+                    ws.cell(row=data_row, column=3, value=f"=SUM(C{header_row+1}:C{data_row-1})")
+                    ws.cell(row=data_row, column=4, value=f"=SUM(D{header_row+1}:D{data_row-1})")
+                    ws.cell(row=data_row, column=5, value=f"=SUM(E{header_row+1}:E{data_row-1})")
+                    ws.cell(row=data_row, column=6, value="")
+                    
+                    for col in range(1, 7):
+                        ws.cell(row=data_row, column=col).font = Font(bold=True)
+                        ws.cell(row=data_row, column=col).fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
+                
+                # ========== 3. DETAYLI KESİM PLANI ==========
+                detay_start_row = data_row + 3
+                ws.cell(row=detay_start_row, column=1, value="DETAYLI KESİM PLANI")
+                ws.cell(row=detay_start_row, column=1).font = Font(size=14, bold=True)
+                ws.merge_cells(f'A{detay_start_row}:F{detay_start_row}')
                 
                 # Başlıklar
-                headers = ["Kesim No", "Stok Boy (mm)", "Kesimler", "Toplam Kesim (mm)", "Fire (mm)", "Kullanım %"]
-                for col, header in enumerate(headers, start=1):
-                    ws.cell(row=start_row, column=col, value=header)
-                    ws.cell(row=start_row, column=col).font = Font(bold=True)
-                    ws.cell(row=start_row, column=col).fill = PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid")
+                detay_headers = ["Kesim No", "Stok Boy (mm)", "Kesimler", "Toplam Kesim (mm)", "Fire (mm)", "Kullanım %"]
+                detay_header_row = detay_start_row + 2
+                for col, header in enumerate(detay_headers, start=1):
+                    ws.cell(row=detay_header_row, column=col, value=header)
+                    ws.cell(row=detay_header_row, column=col).font = Font(bold=True)
+                    ws.cell(row=detay_header_row, column=col).fill = PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid")
                 
                 # Veriler
                 for idx, kesim in sonuc['optimizasyon_df'].iterrows():
-                    row = start_row + idx + 1
+                    row = detay_header_row + idx + 1
                     ws.cell(row=row, column=1, value=kesim['Kesim No'])
                     ws.cell(row=row, column=2, value=kesim['Stok Boy'])
                     
@@ -475,28 +581,42 @@ class TeklaRaporIsleyici:
                 
                 # Kullanılmayan parçalar
                 if sonuc['kullanilmayan_parcalar']:
-                    unused_row = start_row + len(sonuc['optimizasyon_df']) + 3
+                    unused_row = detay_header_row + len(sonuc['optimizasyon_df']) + 3
                     ws.cell(row=unused_row, column=1, value="KULLANILMAYAN PARÇALAR:")
                     ws.cell(row=unused_row, column=1).font = Font(bold=True)
                     
                     for i, parca in enumerate(sonuc['kullanilmayan_parcalar'], start=1):
                         ws.cell(row=unused_row + i, column=1, value=f"- {parca['Boy']} mm")
                 
+                # ========== 4. FORMATLAMA ==========
                 # Sütun genişlikleri
-                for column in ws.columns:
-                    max_length = 0
-                    column_letter = get_column_letter(column[0].column)
-                    for cell in column:
-                        try:
-                            if len(str(cell.value)) > max_length:
-                                max_length = len(str(cell.value))
-                        except:
-                            pass
-                    adjusted_width = min(max_length + 2, 50)
-                    ws.column_dimensions[column_letter].width = adjusted_width
+                column_widths = [35, 12, 15, 18, 12, 12]
+                for i, width in enumerate(column_widths, start=1):
+                    column_letter = get_column_letter(i)
+                    ws.column_dimensions[column_letter].width = width
+                
+                # Hizalama
+                for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=6):
+                    for cell in row:
+                        if cell.column in [2, 3, 4, 5, 6]:  # Sayısal sütunlar
+                            cell.alignment = Alignment(horizontal='right')
+                        else:
+                            cell.alignment = Alignment(horizontal='left')
+                
+                # Auto-filter
+                ws.auto_filter.ref = f"A{detay_header_row}:F{detay_header_row + len(sonuc['optimizasyon_df'])}"
                 
                 # Kaydet
                 wb.save(self.uretilen_excel_yolu)
+                
+                print(f"✅ Optimizasyon raporu güncellendi: Malzeme tipine göre gruplandırıldı")
+                return True
+            
+        except Exception as e:
+            print(f"❌ Optimizasyon sonuçlarını Excel'e kaydetme hatası: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return False
                 
                 return True
             
@@ -1177,4 +1297,5 @@ def main():
     app.calistir()
 
 if __name__ == "__main__":
+
     main()
